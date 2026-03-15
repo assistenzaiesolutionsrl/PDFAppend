@@ -114,7 +114,7 @@ def seal():
                         AP=pikepdf.Dictionary(
                             N=xobj  # Normal appearance = il nostro Form XObject
                         ),
-                        F=pikepdf.Integer(4),  # Print flag
+                        F=4,  # Print flag
                         NM=pikepdf.String(f"FEA-Stamp-{page_index}"),
                         Contents=pikepdf.String("FEA - Firma Elettronica Avanzata"),
                     )
