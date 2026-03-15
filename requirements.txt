@@ -1,3 +1,4 @@
-flask==3.0.3
-pikepdf==9.1.1
-gunicorn==22.0.0
+flask>=3.0.0
+pyhanko>=0.21.0
+pikepdf>=8.0.0
+gunicorn>=21.0.0
