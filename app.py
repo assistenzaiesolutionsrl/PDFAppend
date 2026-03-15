@@ -164,8 +164,7 @@ def seal():
             pdf.save(
                 output_path,
                 linearize=False,
-                recompress_streams=False,
-                fix_metadata_version=False,
+                compress_streams=False,
                 incremental=True,
             )
 
