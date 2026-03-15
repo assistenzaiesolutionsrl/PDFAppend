@@ -208,47 +208,46 @@ def _mark_page(writer, page_ref):
 
 
 def _add_attachment(writer, att):
-    """Aggiunge un file allegato al PDF tramite incremental update."""
-    name = att['name']
+    """Aggiunge un allegato al PDF tramite incremental update (pyhanko)."""
+    import base64
+    from pyhanko.pdf_utils import generic
+
     data = base64.b64decode(att['b64'])
+    name = att['name']
     mime = att.get('mime', 'application/octet-stream')
-    desc = att.get('description', '')
+    description = att.get('description', '')
 
-    ef_stream = generic.StreamObject(
-        stream_data=data,
-        dict_data={
-            '/Type':    _n('/EmbeddedFile'),
-            '/Params':  generic.DictionaryObject({
-                '/Size': generic.NumberObject(len(data)),
-            }),
-        }
-    )
-    ef_ref = writer.add_object(ef_stream)
+    # Crea lo stream del file
+    file_stream = generic.StreamObject(data)
+    file_stream['/Type'] = generic.pdf_name('/EmbeddedFile')
+    file_stream['/Subtype'] = generic.pdf_name('/' + mime.replace('/', '#2F'))
+    file_stream_ref = writer.add_object(file_stream)
 
+    # File spec dictionary
     filespec = generic.DictionaryObject({
-        '/Type': _n('/Filespec'),
-        '/F':    _str(name),
-        '/UF':   _str(name),
-        '/Desc': _str(desc),
-        '/EF':   generic.DictionaryObject({'/F': ef_ref}),
+        generic.pdf_name('/Type'): generic.pdf_name('/Filespec'),
+        generic.pdf_name('/F'): generic.pdf_string(name),
+        generic.pdf_name('/UF'): generic.pdf_string(name),
+        generic.pdf_name('/Desc'): generic.pdf_string(description),
+        generic.pdf_name('/EF'): generic.DictionaryObject({
+            generic.pdf_name('/F'): file_stream_ref,
+        }),
     })
-    fs_ref = writer.add_object(filespec)
+    filespec_ref = writer.add_object(filespec)
 
-    root_ref = writer.prev.root.container_ref
-    root = writer.get_object(root_ref.reference)
-
+    # Aggiungi al Names tree del catalogo
+    root = writer.root
     if '/Names' not in root:
-        root['/Names'] = generic.DictionaryObject()
+        root['/Names'] = writer.add_object(generic.DictionaryObject())
     names = root['/Names']
-
     if '/EmbeddedFiles' not in names:
-        names['/EmbeddedFiles'] = generic.DictionaryObject({
-            '/Names': generic.ArrayObject()
-        })
-
-    names['/EmbeddedFiles']['/Names'].append(_str(name))
-    names['/EmbeddedFiles']['/Names'].append(fs_ref)
-    writer.mark_update(root_ref.reference)
+        names['/EmbeddedFiles'] = writer.add_object(generic.DictionaryObject({
+            generic.pdf_name('/Names'): generic.ArrayObject(),
+        }))
+    ef = names['/EmbeddedFiles']
+    ef['/Names'].append(generic.pdf_string(name))
+    ef['/Names'].append(filespec_ref)
+    
 
 
 # ─── Route principale ────────────────────────────────────────────────────────
