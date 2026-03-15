@@ -1,275 +1,299 @@
-from flask import Flask, request, jsonify
-import pikepdf
-import base64
+"""
+app.py — pyhanko-seal microservice
+Aggiunge timbri visivi e allegati ai PDF tramite incremental update.
+Preserva le firme digitali esistenti (FEQ).
+"""
 import io
 import os
-import hashlib
-import hmac
-import tempfile
-import shutil
+import base64
 import traceback
+import pikepdf
+from flask import Flask, request, jsonify
+from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
+from pyhanko.pdf_utils import generic
 
 app = Flask(__name__)
+SECRET = os.environ.get('SECRET', '')
 
-SHARED_SECRET = os.environ.get("PYHANKO_SECRET", "")
+# ─── Helpers PDF ──────────────────────────────────────────────────────────────
 
-
-def verify_secret(req_secret):
-    if not SHARED_SECRET:
-        return True
-    return hmac.compare_digest(req_secret or "", SHARED_SECRET)
-
-
-def get_docmdp_permission(pdf):
-    """
-    Legge il livello di permesso DocMDP dal PDF firmato:
-      1 = nessuna modifica consentita dopo la firma
-      2 = solo compilazione campi form e aggiunta firme
-      3 = annotazioni, form e firme consentite
-      None = nessuna restrizione DocMDP presente
-    Fonte: PDF spec ISO 32000, sezione 12.8.2.2
-    """
-    try:
-        # Percorso standard DocMDP: /Root/Perms/DocMDP
-        catalog = pdf.Root
-        if "/Perms" in catalog:
-            perms = catalog["/Perms"]
-            if "/DocMDP" in perms:
-                sig = perms["/DocMDP"]
-                if "/Reference" in sig:
-                    for ref in sig["/Reference"]:
-                        tm = ref.get("/TransformMethod")
-                        if tm == pikepdf.Name("/DocMDP"):
-                            params = ref.get("/TransformParams")
-                            if params and "/P" in params:
-                                return int(params["/P"])
-    except Exception as ex:
-        print(f"DocMDP read warning: {ex}", flush=True)
-    return None  # nessuna restrizione rilevata
+def _n(name):
+    """Crea un NameObject pyhanko da stringa /Nome."""
+    return generic.NameObject(name)
 
 
-def add_visual_stamp(pdf, stamp_info, page_index):
-    """
-    Aggiunge il timbro FEA come Annotation (Appearance Stream).
-    Non tocca il content stream originale della pagina — solo /Annots.
-    """
-    stamp_bytes = base64.b64decode(stamp_info["stamp_pdf_b64"])
+def _str(s):
+    """Crea una stringa PDF pyhanko."""
+    return generic.pdf_string(s)
 
-    if page_index >= len(pdf.pages):
-        page_index = len(pdf.pages) - 1
 
-    page = pdf.pages[page_index]
+def _get_content_bytes(obj):
+    """Estrae i byte decodificati da un Content stream (singolo o array)."""
+    if isinstance(obj, pikepdf.Array):
+        data = b''
+        for item in obj:
+            data += bytes(item.read_bytes())
+        return data
+    return bytes(obj.read_bytes())
 
-    with pikepdf.open(io.BytesIO(stamp_bytes)) as stamp_doc:
-        stamp_page = stamp_doc.pages[0]
 
-        # Estrai content stream del timbro
-        content_bytes = b""
-        if "/Contents" in stamp_page.obj:
-            contents = stamp_page.obj["/Contents"]
-            if isinstance(contents, pikepdf.Array):
-                for s in contents:
-                    content_bytes += s.read_raw_bytes()
+def _pikepdf_val_to_generic(val, writer, src_doc):
+    """Converte ricorsivamente un valore pikepdf in un oggetto pyhanko/generic."""
+    if isinstance(val, pikepdf.Dictionary):
+        d = generic.DictionaryObject()
+        for k, v in val.items():
+            d[str(k)] = _pikepdf_val_to_generic(v, writer, src_doc)
+        return d
+    elif isinstance(val, pikepdf.Array):
+        return generic.ArrayObject([_pikepdf_val_to_generic(i, writer, src_doc) for i in val])
+    elif isinstance(val, pikepdf.Name):
+        return generic.NameObject(str(val))
+    elif isinstance(val, pikepdf.String):
+        return generic.pdf_string(bytes(val))
+    elif isinstance(val, pikepdf.Stream):
+        data = bytes(val.read_bytes())
+        d = {}
+        for k, v in val.items():
+            if str(k) in ('/Length', '/Filter', '/DecodeParms'):
+                continue
+            d[str(k)] = _pikepdf_val_to_generic(v, writer, src_doc)
+        s = generic.StreamObject(stream_data=data, dict_data=d)
+        return writer.add_object(s)
+    elif isinstance(val, bool):
+        return generic.BooleanObject(val)
+    elif isinstance(val, int):
+        return generic.NumberObject(val)
+    elif isinstance(val, float):
+        return generic.FloatObject(val)
+    else:
+        return generic.NullObject()
+
+
+def _build_resources(writer, stamp_page_obj, src_doc):
+    """Costruisce il dict /Resources per il Form XObject del timbro."""
+    if '/Resources' not in stamp_page_obj:
+        return generic.DictionaryObject()
+
+    src_res = stamp_page_obj['/Resources']
+    res = generic.DictionaryObject()
+
+    for key in ('/Font', '/ExtGState', '/ColorSpace', '/Pattern', '/Shading'):
+        if key not in src_res:
+            continue
+        sub = generic.DictionaryObject()
+        for name, obj in src_res[key].items():
+            if isinstance(obj, pikepdf.Stream):
+                converted = _pikepdf_val_to_generic(obj, writer, src_doc)
             else:
-                content_bytes = contents.read_raw_bytes()
+                d = generic.DictionaryObject()
+                if isinstance(obj, pikepdf.Dictionary):
+                    for k, v in obj.items():
+                        d[str(k)] = _pikepdf_val_to_generic(v, writer, src_doc)
+                    converted = writer.add_object(d)
+                else:
+                    converted = _pikepdf_val_to_generic(obj, writer, src_doc)
+            sub[str(name)] = converted
+        res[key] = sub
 
-        w = float(stamp_page.mediabox[2])
-        h = float(stamp_page.mediabox[3])
+    # XObject annidati
+    if '/XObject' in src_res:
+        xsub = generic.DictionaryObject()
+        for name, obj in src_res['/XObject'].items():
+            if isinstance(obj, pikepdf.Stream):
+                xsub[str(name)] = _pikepdf_val_to_generic(obj, writer, src_doc)
+            else:
+                xsub[str(name)] = _pikepdf_val_to_generic(obj, writer, src_doc)
+        res['/XObject'] = xsub
 
-        # Crea Form XObject con il contenuto grafico del timbro
-        xobj = pdf.make_stream(content_bytes)
-        xobj["/Type"] = pikepdf.Name("/XObject")
-        xobj["/Subtype"] = pikepdf.Name("/Form")
-        xobj["/BBox"] = pikepdf.Array([0, 0, w, h])
-
-        if "/Resources" in stamp_page.obj:
-            xobj["/Resources"] = pdf.copy_foreign(
-                stamp_doc.make_indirect(stamp_page.obj["/Resources"])
-            )
-
-        # Assicura che Resources/XObject esista sulla pagina
-        if "/Resources" not in page:
-            page["/Resources"] = pikepdf.Dictionary()
-        if "/XObject" not in page["/Resources"]:
-            page["/Resources"]["/XObject"] = pikepdf.Dictionary()
-
-        xobj_name = pikepdf.Name(f"/FeaStamp{page_index}")
-        page["/Resources"]["/XObject"][xobj_name] = xobj
-
-        rect_x = float(stamp_info.get("x", 0))
-        rect_y = float(stamp_info.get("y", 0))
-
-        # Annotation Stamp — non modifica il content stream originale
-        annotation = pikepdf.Dictionary(
-            Type=pikepdf.Name("/Annot"),
-            Subtype=pikepdf.Name("/Stamp"),
-            Rect=pikepdf.Array([rect_x, rect_y, rect_x + w, rect_y + h]),
-            AP=pikepdf.Dictionary(N=xobj),
-            F=4,  # Print flag: visibile e stampabile
-            NM=pikepdf.String(f"FEA-Stamp-{page_index}"),
-            Contents=pikepdf.String("FEA - Firma Elettronica Avanzata"),
-        )
-
-        if "/Annots" not in page.obj:
-            page.obj["/Annots"] = pikepdf.Array()
-        page.obj["/Annots"].append(pdf.make_indirect(annotation))
+    return res
 
 
-def add_attachment(pdf, att):
-    """Aggiunge un file allegato al PDF (es. timestamp.tsr, audit_chain.txt)."""
-    att_bytes = base64.b64decode(att["b64"])
-    att_name = att["name"]
-    att_mime = att.get("mime", "application/octet-stream")
+def _get_page_refs(writer):
+    """
+    Restituisce lista di reference pyhanko per ogni pagina del documento.
+    Gestisce alberi di pagine piatti e annidati.
+    """
+    refs = []
 
-    ef_stream = pdf.make_stream(att_bytes)
-    ef_stream["/Type"] = pikepdf.Name("/EmbeddedFile")
-    ef_stream["/Subtype"] = pikepdf.Name(
-        "/" + att_mime.replace("/", "#2F").replace(";", "#3B")
+    def walk(node_val):
+        if hasattr(node_val, 'get_object'):
+            node = node_val.get_object()
+        else:
+            node = node_val
+
+        obj_type = node.get('/Type', generic.NameObject(''))
+        if obj_type == generic.NameObject('/Page'):
+            refs.append(node_val)
+        elif obj_type == generic.NameObject('/Pages'):
+            kids = node.get('/Kids', generic.ArrayObject())
+            for kid in kids:
+                walk(kid)
+
+    root = writer.prev.root
+    pages_val = root.raw_get('/Pages')
+    walk(pages_val)
+    return refs
+
+
+def _add_stamp(writer, page_index, stamp_pdf_bytes):
+    """Aggiunge un timbro come annotazione Stamp con appearance stream sul documento."""
+    stamp_doc = pikepdf.open(io.BytesIO(stamp_pdf_bytes))
+    stamp_page = stamp_doc.pages[0]
+
+    bbox = [float(x) for x in stamp_page.mediabox]
+    pw = bbox[2] - bbox[0]
+    ph = bbox[3] - bbox[1]
+
+    # Estrai content bytes
+    content_bytes = b''
+    if '/Contents' in stamp_page.obj:
+        content_bytes = _get_content_bytes(stamp_page.obj['/Contents'])
+
+    # Costruisci risorse
+    resources = _build_resources(writer, stamp_page.obj, stamp_doc)
+
+    # Crea Form XObject (appearance stream)
+    xobj = generic.StreamObject(
+        stream_data=content_bytes,
+        dict_data={
+            '/Type':     _n('/XObject'),
+            '/Subtype':  _n('/Form'),
+            '/FormType': generic.NumberObject(1),
+            '/BBox':     generic.ArrayObject([
+                generic.FloatObject(0), generic.FloatObject(0),
+                generic.FloatObject(pw), generic.FloatObject(ph),
+            ]),
+            '/Resources': resources,
+        }
     )
-    ef_stream["/Params"] = pikepdf.Dictionary(
-        Size=len(att_bytes),
-        CheckSum=hashlib.md5(att_bytes).digest(),
+    xobj_ref = writer.add_object(xobj)
+
+    # Crea annotazione Stamp
+    annot = generic.DictionaryObject({
+        '/Type':    _n('/Annot'),
+        '/Subtype': _n('/Stamp'),
+        '/Rect':    generic.ArrayObject([
+            generic.FloatObject(0), generic.FloatObject(0),
+            generic.FloatObject(pw), generic.FloatObject(ph),
+        ]),
+        '/F':  generic.NumberObject(4),
+        '/AP': generic.DictionaryObject({'/N': xobj_ref}),
+    })
+    annot_ref = writer.add_object(annot)
+
+    # Aggiungi annotazione alla pagina
+    page_refs = _get_page_refs(writer)
+    if page_index >= len(page_refs):
+        page_index = len(page_refs) - 1
+    page_ref = page_refs[page_index]
+    page_obj = writer.get_object(page_ref.reference if hasattr(page_ref, 'reference') else page_ref)
+
+    if '/Annots' in page_obj:
+        raw_annots = page_obj.raw_get('/Annots')
+        if isinstance(raw_annots, generic.IndirectObject):
+            annots_obj = writer.get_object(raw_annots.reference)
+            annots_obj.append(annot_ref)
+            writer.mark_update(raw_annots.reference)
+        else:
+            page_obj['/Annots'].append(annot_ref)
+            _mark_page(writer, page_ref)
+    else:
+        page_obj['/Annots'] = generic.ArrayObject([annot_ref])
+        _mark_page(writer, page_ref)
+
+
+def _mark_page(writer, page_ref):
+    ref = page_ref.reference if hasattr(page_ref, 'reference') else page_ref
+    writer.mark_update(ref)
+
+
+def _add_attachment(writer, att):
+    """Aggiunge un file allegato al PDF tramite incremental update."""
+    name = att['name']
+    data = base64.b64decode(att['b64'])
+    mime = att.get('mime', 'application/octet-stream')
+    desc = att.get('description', '')
+
+    ef_stream = generic.StreamObject(
+        stream_data=data,
+        dict_data={
+            '/Type':    _n('/EmbeddedFile'),
+            '/Params':  generic.DictionaryObject({
+                '/Size': generic.NumberObject(len(data)),
+            }),
+        }
     )
+    ef_ref = writer.add_object(ef_stream)
 
-    fs_dict = pikepdf.Dictionary(
-        Type=pikepdf.Name("/Filespec"),
-        F=att_name,
-        UF=att_name,
-        EF=pikepdf.Dictionary(F=ef_stream),
-        Desc=att.get("description", ""),
-    )
+    filespec = generic.DictionaryObject({
+        '/Type': _n('/Filespec'),
+        '/F':    _str(name),
+        '/UF':   _str(name),
+        '/Desc': _str(desc),
+        '/EF':   generic.DictionaryObject({'/F': ef_ref}),
+    })
+    fs_ref = writer.add_object(filespec)
 
-    catalog = pdf.Root
-    if "/Names" not in catalog:
-        catalog["/Names"] = pikepdf.Dictionary()
-    if "/EmbeddedFiles" not in catalog["/Names"]:
-        catalog["/Names"]["/EmbeddedFiles"] = pikepdf.Dictionary(
-            Names=pikepdf.Array()
-        )
+    root = writer.prev.root
+    root_ref = writer.prev.root_ref
 
-    names_arr = catalog["/Names"]["/EmbeddedFiles"]["/Names"]
-    names_arr.append(pikepdf.String(att_name))
-    names_arr.append(fs_dict)
+    if '/Names' not in root:
+        root['/Names'] = generic.DictionaryObject()
+    names = root['/Names']
 
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok", "service": "pyhanko-seal"})
-
-
-@app.route("/seal", methods=["POST"])
-def seal():
-    tmp_orig_path = None
-    output_path = None
-    docmdp = None
-    visual_stamp_added = False
-
-    try:
-        data = request.get_json(force=True)
-
-        if not verify_secret(data.get("secret", "")):
-            return jsonify({"error": "Unauthorized"}), 401
-
-        original_b64 = data.get("original_pdf_b64", "")
-        if not original_b64:
-            return jsonify({"error": "Missing original_pdf_b64"}), 400
-
-        original_bytes = base64.b64decode(original_b64)
-        stamps     = data.get("stamps", [])
-        attachments = data.get("attachments", [])
-
-        # Scrivi PDF originale su file temporaneo
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_orig:
-            tmp_orig.write(original_bytes)
-            tmp_orig_path = tmp_orig.name
-
-        output_path = tmp_orig_path + "_sealed.pdf"
-
-        # ── STEP 1: Leggi DocMDP PRIMA di aprire in write mode ──────────────
-        with pikepdf.open(tmp_orig_path) as pdf_ro:
-            docmdp = get_docmdp_permission(pdf_ro)
-
-        print(f"DocMDP level rilevato: {docmdp}", flush=True)
-
-        # Regole DocMDP:
-        # None o 3 → annotazioni consentite → aggiungi timbro visivo
-        # 2        → solo form/firme → skip timbro, solo allegati
-        # 1        → nessuna modifica → skip timbro, solo allegati
-        can_add_annotations = (docmdp is None or docmdp >= 3)
-
-        if not can_add_annotations:
-            print(
-                f"DocMDP={docmdp}: timbro visivo NON aggiunto per preservare FEQ. "
-                f"Aggiungo solo allegati.",
-                flush=True
-            )
-
-        # ── STEP 2: Copia byte-per-byte — i byte 0→N non vengono mai riscritti
-        shutil.copy2(tmp_orig_path, output_path)
-
-        # ── STEP 3: Apri la copia e applica modifiche incrementali ──────────
-        with pikepdf.open(output_path, allow_overwriting_input=True) as pdf:
-
-            if can_add_annotations:
-                for stamp_info in stamps:
-                    page_index = stamp_info.get("page_index", 0)
-                    add_visual_stamp(pdf, stamp_info, page_index)
-                    visual_stamp_added = True
-                    print(f"Timbro FEA aggiunto a pagina {page_index}", flush=True)
-
-            for att in attachments:
-                add_attachment(pdf, att)
-                print(f"Allegato aggiunto: {att.get('name')}", flush=True)
-
-            # ── STEP 4: Salva in modalità INCREMENTALE ─────────────────────
-            # incremental=True → appende solo i nuovi oggetti in coda al file.
-            # I byte originali (0→N) rimangono INTATTI → FEQ resta valida.
-            pdf.save(
-                output_path,
-                linearize=False,
-                compress_streams=False,
-                incremental=True,
-            )
-
-        with open(output_path, "rb") as f:
-            signed_bytes = f.read()
-
-        print(
-            f"Seal completato. "
-            f"Dimensione originale: {len(original_bytes)}b → "
-            f"Risultato: {len(signed_bytes)}b "
-            f"(+{len(signed_bytes)-len(original_bytes)}b incremento)",
-            flush=True
-        )
-
-        return jsonify({
-            "signed_pdf_b64":    base64.b64encode(signed_bytes).decode(),
-            "docmdp_level":      docmdp,
-            "visual_stamp_added": visual_stamp_added,
-            "original_size":     len(original_bytes),
-            "sealed_size":       len(signed_bytes),
+    if '/EmbeddedFiles' not in names:
+        names['/EmbeddedFiles'] = generic.DictionaryObject({
+            '/Names': generic.ArrayObject()
         })
 
+    names['/EmbeddedFiles']['/Names'].append(_str(name))
+    names['/EmbeddedFiles']['/Names'].append(fs_ref)
+    writer.mark_update(root_ref)
+
+
+# ─── Route principale ────────────────────────────────────────────────────────
+
+@app.route('/health')
+def health():
+    return jsonify({"service": "pyhanko-seal", "status": "ok"})
+
+
+@app.route('/seal', methods=['POST'])
+def seal():
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "Missing JSON body"}), 400
+
+        if SECRET and data.get('secret', '') != SECRET:
+            return jsonify({"error": "Unauthorized"}), 401
+
+        original_bytes = base64.b64decode(data['original_pdf_b64'])
+        stamps = data.get('stamps', [])
+        attachments = data.get('attachments', [])
+
+        input_buf = io.BytesIO(original_bytes)
+        output_buf = io.BytesIO()
+
+        writer = IncrementalPdfFileWriter(input_buf)
+
+        for stamp_data in stamps:
+            _add_stamp(writer, stamp_data['page_index'], base64.b64decode(stamp_data['stamp_pdf_b64']))
+
+        for att in attachments:
+            _add_attachment(writer, att)
+
+        writer.write(output_buf)
+        result_bytes = output_buf.getvalue()
+
+        return jsonify({"signed_pdf_b64": base64.b64encode(result_bytes).decode()})
+
     except Exception as e:
-        print("SEAL ERROR:", traceback.format_exc(), flush=True)
-        return jsonify({
-            "error":     str(e),
-            "traceback": traceback.format_exc()
-        }), 500
-
-    finally:
-        if tmp_orig_path:
-            try:
-                os.unlink(tmp_orig_path)
-            except Exception:
-                pass
-        if output_path:
-            try:
-                os.unlink(output_path)
-            except Exception:
-                pass
+        tb = traceback.format_exc()
+        print(f"[SEAL ERROR] {e}\n{tb}", flush=True)
+        return jsonify({"error": str(e), "traceback": tb}), 500
 
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port)
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
