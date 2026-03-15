@@ -275,7 +275,7 @@ def seal():
         input_buf = io.BytesIO(original_bytes)
         output_buf = io.BytesIO()
 
-        writer = IncrementalPdfFileWriter(input_buf)
+        writer = IncrementalPdfFileWriter(input_buf, strict=False)
 
         for stamp_data in stamps:
             _add_stamp(writer, stamp_data['page_index'], base64.b64decode(stamp_data['stamp_pdf_b64']))
