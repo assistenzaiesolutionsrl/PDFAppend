@@ -89,8 +89,10 @@ def seal():
                     xobj["/BBox"] = pikepdf.Array([0, 0, w, h])
 
                     if "/Resources" in stamp_page.obj:
+                        resources = stamp_page.obj["/Resources"]
+                        # copy_foreign richiede un oggetto indiretto
                         xobj["/Resources"] = stamp_doc.copy_foreign(
-                            stamp_page.obj["/Resources"]
+                            stamp_doc.make_indirect(resources)
                         )
 
                     xobj_name = pikepdf.Name(f"/Stamp{page_index}")
