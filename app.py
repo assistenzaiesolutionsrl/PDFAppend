@@ -234,8 +234,8 @@ def _add_attachment(writer, att):
     })
     fs_ref = writer.add_object(filespec)
 
-    root = writer.prev.root
-    root_ref = writer.prev.root_ref
+    root_ref = writer.prev.root.container_ref
+    root = writer.get_object(root_ref.reference)
 
     if '/Names' not in root:
         root['/Names'] = generic.DictionaryObject()
@@ -248,7 +248,7 @@ def _add_attachment(writer, att):
 
     names['/EmbeddedFiles']['/Names'].append(_str(name))
     names['/EmbeddedFiles']['/Names'].append(fs_ref)
-    writer.mark_update(root_ref)
+    writer.mark_update(root_ref.reference)
 
 
 # ─── Route principale ────────────────────────────────────────────────────────
