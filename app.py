@@ -13,7 +13,6 @@ app = Flask(__name__)
 
 SHARED_SECRET = os.environ.get("PYHANKO_SECRET", "")
 
-
 def verify_secret(req_secret):
     if not SHARED_SECRET:
         return True
