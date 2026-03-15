@@ -7,10 +7,11 @@ import hashlib
 import hmac
 import tempfile
 import shutil
+import traceback
 
 app = Flask(__name__)
 
-SHARED_SECRET = os.environ.get("PYHANKO_SECRET", "5ouNyXq6nfIUrxwKPEFbajOL7ClAih2HJpRsm3W9kYVGSctv")
+SHARED_SECRET = os.environ.get("PYHANKO_SECRET", "")
 
 
 def verify_secret(req_secret):
@@ -26,26 +27,28 @@ def health():
 
 @app.route("/seal", methods=["POST"])
 def seal():
-    data = request.get_json(force=True)
-
-    if not verify_secret(data.get("secret", "")):
-        return jsonify({"error": "Unauthorized"}), 401
-
-    original_b64 = data.get("original_pdf_b64", "")
-    if not original_b64:
-        return jsonify({"error": "Missing original_pdf_b64"}), 400
-
-    original_bytes = base64.b64decode(original_b64)
-    stamps = data.get("stamps", [])
-    attachments = data.get("attachments", [])
-
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_orig:
-        tmp_orig.write(original_bytes)
-        tmp_orig_path = tmp_orig.name
-
-    output_path = tmp_orig_path + "_sealed.pdf"
-
+    tmp_orig_path = None
+    output_path = None
     try:
+        data = request.get_json(force=True)
+
+        if not verify_secret(data.get("secret", "")):
+            return jsonify({"error": "Unauthorized"}), 401
+
+        original_b64 = data.get("original_pdf_b64", "")
+        if not original_b64:
+            return jsonify({"error": "Missing original_pdf_b64"}), 400
+
+        original_bytes = base64.b64decode(original_b64)
+        stamps = data.get("stamps", [])
+        attachments = data.get("attachments", [])
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_orig:
+            tmp_orig.write(original_bytes)
+            tmp_orig_path = tmp_orig.name
+
+        output_path = tmp_orig_path + "_sealed.pdf"
+
         # Copia byte-per-byte l'originale — i byte 0→N non verranno mai toccati
         shutil.copy2(tmp_orig_path, output_path)
 
@@ -164,7 +167,7 @@ def seal():
                 linearize=False,
                 recompress_streams=False,
                 fix_metadata_version=False,
-                incremental=True,        # ← LA RIGA CHE RISOLVE TUTTO
+                incremental=True,
             )
 
         with open(output_path, "rb") as f:
@@ -172,15 +175,26 @@ def seal():
 
         return jsonify({"signed_pdf_b64": base64.b64encode(signed_bytes).decode()})
 
+    except Exception as e:
+        # Logga il dettaglio completo nei log Railway (visibile nella tab Logs)
+        print("SEAL ERROR:", traceback.format_exc(), flush=True)
+        return jsonify({
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
     finally:
-        try:
-            os.unlink(tmp_orig_path)
-        except Exception:
-            pass
-        try:
-            os.unlink(output_path)
-        except Exception:
-            pass
+        # Pulizia file temporanei — sempre, anche in caso di errore
+        if tmp_orig_path:
+            try:
+                os.unlink(tmp_orig_path)
+            except Exception:
+                pass
+        if output_path:
+            try:
+                os.unlink(output_path)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
